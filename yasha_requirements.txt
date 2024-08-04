@@ -1,0 +1,5 @@
+oracle-guardian-ai[fairness]
+folktables
+fairlearn
+error-parity
+scikit-learn

@@ -1772,3 +1772,86 @@ class _PredictionScorer:
 
     def __call__(self, y_true, y_pred):
         return self.scorer(self.dummy_model, y_pred, y_true)
+
+
+from eo_extension_gpa import ThresholdOptimizerIncludingLevellingDown
+
+
+class EOModelBiasMitigator(ModelBiasMitigator):
+    def fit(self, X: pd.DataFrame, y: Union[pd.DataFrame, pd.Series, np.ndarray]):
+        groups, group_names = self._prepare_subgroups(X)
+
+        X, y, group_names, groups = self._apply_subsampling(X, y, group_names, groups)
+
+        self._probas_predicted = self._get_base_probas(X)
+        self._groups = groups
+        self._X = X
+        self._y = y
+
+        # Get masks for filtering data by each group
+        group_masks = {}
+        for group, group_name in zip(self._unique_groups_, self._unique_group_names_):
+            mask = (groups == group).all(1).to_numpy().squeeze()
+            group_masks[group_name] = mask
+
+        self._group_masks = group_masks
+
+        if self.fairness_metric_name in _inhouse_metrics:
+            # Get a rate calculator/scorer for the given constraint
+            rate_scorer = _get_rate_scorer(self.fairness_metric_name)
+            self._rate_scorer = rate_scorer
+
+        y_np = y.to_numpy()
+        pareto_front_data = []
+        # For some metrics, we can calculate additional defaults
+        if self.fairness_metric_name in _inhouse_metrics and self._warmstart:
+            # Check if metric is supported by fairlearn
+            if self.fairness_metric_name in _automl_to_fairlearn_metric_names:
+                # Fit the EO method as implemented in fairlearn
+                adjusted_model = ThresholdOptimizerIncludingLevellingDown(
+                    grid_size=100,  # I reduced this from 1_000 to 100 to speed up computation a bit (reducing the number of Pareto points)
+                    estimator=self._base_estimator,
+                    constraints=_automl_to_fairlearn_metric_names[
+                        self.fairness_metric_name
+                    ],
+                    objective=(
+                        "accuracy_score"
+                        if self.accuracy_metric_name == "accuracy"
+                        else "balanced_accuracy_score"
+                    ),
+                    prefit=True,
+                )
+                adjusted_model.fit(X, y, sensitive_features=groups)
+
+                data = {}
+                for (
+                    datapoint
+                ) in adjusted_model.interpolated_thresholder_pareto_frontier:
+                    data[self.accuracy_metric_name] = datapoint["accuracy"]
+                    data[self.fairness_metric_name] = datapoint["expected_disparity"]
+                    data[self._third_objective_name] = datapoint["levelling_down"]
+                    model = datapoint["classifier"]
+
+                    adjusted_predictions = model.predict(X, sensitive_features=groups)
+                    target_rate = rate_scorer(y_np, adjusted_predictions)
+
+                    # Find multipliers that produce the corresponding target rate as closely as possible for each group
+                    multipliers_eo = self._find_multipliers_for_rate(
+                        y_np,
+                        target_rate,
+                        rate_scorer,
+                        group_masks,
+                    )
+
+                    for multiplier_name, multiplier_eo in multipliers_eo.items():
+                        data[multiplier_name] = multiplier_eo
+                    pareto_front_data.append(data)
+
+        self._best_trials_detailed = pd.DataFrame(pareto_front_data)
+
+        self._select_best_model_from_constraints()
+
+        # Otherwise the object cannot be pickled
+        self._objective_fn = None
+
+        return self

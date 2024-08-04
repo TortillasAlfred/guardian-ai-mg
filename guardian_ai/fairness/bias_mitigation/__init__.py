@@ -6,3 +6,4 @@
 
 """Guardian AI fairness bias mitigation module"""
 from guardian_ai.fairness.bias_mitigation.sklearn import ModelBiasMitigator
+from guardian_ai.fairness.bias_mitigation.sklearn import EOModelBiasMitigator
